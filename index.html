@@ -225,8 +225,10 @@
         <div class="field">
           <label for="model">โมเดล</label>
           <select id="model"></select>
-          <input type="text" id="modelCustom" placeholder="ชื่อโมเดล" style="margin-top:6px;display:none" spellcheck="false">
+          <input type="text" id="modelCustom" placeholder="ชื่อโมเดล เช่น gemini-flash-latest" style="margin-top:6px;display:none" spellcheck="false">
           <div class="help">ตัวเร็วตอบไวกว่า ตัวฉลาดแปลลื่นกว่าแต่ช้ากว่าเล็กน้อย</div>
+          <button id="btnFetchModels" style="width:100%;margin-top:8px">⟳ ดึงรายชื่อโมเดลทั้งหมดจาก API key นี้</button>
+          <div class="testres" id="fetchRes"></div>
         </div>
         <div class="field">
           <label for="game">ชื่อเกม (ช่วยให้แปลชื่อตัวละคร/ศัพท์ได้ถูก)</label>
@@ -323,6 +325,7 @@
     game: '', lang: 'Thai', sens: 0.35, interval: 700, fontSize: 34, showOrig: true,
     box: { x: 0.08, y: 0.74, w: 0.84, h: 0.2 }, deviceId: '',
     linkCode: '', displayCode: '',
+    modelList: { gemini: [], claude: [] }, // fetched from the provider: [[id, label], ...]
   };
   const STORE = 'subtr.cfg.v1';
   const PEER_PREFIX = 'subtr-th-v1-';
@@ -331,7 +334,7 @@
   function load() {
     try {
       const s = JSON.parse(localStorage.getItem(STORE) || 'null');
-      if (s) return { ...DEFAULTS, ...s, keys: { ...DEFAULTS.keys, ...(s.keys || {}) }, model: { ...DEFAULTS.model, ...(s.model || {}) }, box: { ...DEFAULTS.box, ...(s.box || {}) } };
+      if (s) return { ...DEFAULTS, ...s, keys: { ...DEFAULTS.keys, ...(s.keys || {}) }, model: { ...DEFAULTS.model, ...(s.model || {}) }, box: { ...DEFAULTS.box, ...(s.box || {}) }, modelList: { gemini: [], claude: [], ...(s.modelList || {}) } };
     } catch (e) {}
     return JSON.parse(JSON.stringify(DEFAULTS));
   }
@@ -679,6 +682,48 @@
     } finally { clearTimeout(to); }
   }
 
+  // List every model this key can use, so the user can pick newer/other models without typing names.
+  async function fetchModels() {
+    const key = activeKey();
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      if (cfg.provider === 'claude') {
+        const out = []; let after = '';
+        for (let page = 0; page < 5; page++) {
+          const r = await fetch('https://api.anthropic.com/v1/models?limit=100' + (after ? '&after_id=' + encodeURIComponent(after) : ''), {
+            signal: ctrl.signal,
+            headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+          });
+          const body = await r.text();
+          if (!r.ok) throw httpError(r.status, body);
+          const j = JSON.parse(body);
+          (j.data || []).forEach(m => out.push([m.id, (m.display_name || m.id) + '  ·  ' + m.id]));
+          if (!j.has_more || !j.last_id) break;
+          after = j.last_id;
+        }
+        return out;
+      } else {
+        const out = []; let token = '';
+        for (let page = 0; page < 5; page++) {
+          const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=' + encodeURIComponent(key) + (token ? '&pageToken=' + encodeURIComponent(token) : ''), { signal: ctrl.signal });
+          const body = await r.text();
+          if (!r.ok) throw httpError(r.status, body);
+          const j = JSON.parse(body);
+          (j.models || []).forEach(m => {
+            const id = String(m.name || '').replace(/^models\//, '');
+            const ok = (m.supportedGenerationMethods || []).includes('generateContent');
+            // keep text+vision chat models; skip embedding / image-generation / speech / live-audio models
+            if (!ok || !/gemini|gemma/i.test(id) || /embed|tts|image|audio|live|veo|imagen|aqa|robotics|computer-use/i.test(id)) return;
+            out.push([id, (m.displayName || id) + '  ·  ' + id]);
+          });
+          if (!j.nextPageToken) break;
+          token = j.nextPageToken;
+        }
+        return out;
+      }
+    } finally { clearTimeout(to); }
+  }
+
   function cropJPEG() {
     const p = boxPx();
     const scale = Math.min(1, 1100 / p.sw);
@@ -908,10 +953,20 @@
     document.body.classList.toggle('hide-orig', !cfg.showOrig);
   }
   function renderModelSelect() {
-    const sel = $('model'), list = MODELS[cfg.provider], cur = activeModel();
+    const sel = $('model'), cur = activeModel();
+    const rec = MODELS[cfg.provider].filter(([v]) => v !== '__custom');
+    const fetched = (cfg.modelList[cfg.provider] || []).filter(([v]) => !rec.some(([r]) => r === v));
     sel.innerHTML = '';
-    list.forEach(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; sel.appendChild(o); });
-    const known = list.some(([v]) => v === cur);
+    const group = (label, items) => {
+      if (!items.length) return;
+      const g = document.createElement('optgroup'); g.label = label;
+      items.forEach(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; g.appendChild(o); });
+      sel.appendChild(g);
+    };
+    group('แนะนำ', rec);
+    group('ทั้งหมดที่ key นี้ใช้ได้', fetched);
+    const oc = document.createElement('option'); oc.value = '__custom'; oc.textContent = 'กำหนดเอง…'; sel.appendChild(oc);
+    const known = rec.concat(fetched).some(([v]) => v === cur);
     sel.value = known ? cur : '__custom';
     $('modelCustom').style.display = known ? 'none' : 'block';
     $('modelCustom').value = known ? '' : cur;
@@ -930,6 +985,7 @@
     $('btnLink').textContent = (link && link.code) ? 'ยกเลิก' : 'เชื่อมต่อ';
     $('btnRole').textContent = role === 'display' ? 'เปลี่ยนเครื่องนี้เป็น: 📷 กล้อง + แปล' : 'เปลี่ยนเครื่องนี้เป็น: 🖥 จอแสดงคำแปล';
     $('testRes').textContent = '';
+    $('fetchRes').textContent = '';
   }
   function openSettings() { renderSettings(); $('modal').classList.add('open'); }
   function closeSettings() { save(); applyView(); $('modal').classList.remove('open'); if (role === 'camera') updateMeta(); }
@@ -1016,6 +1072,22 @@
       const c = $('linkCode').value.replace(/\D/g, '');
       if (c.length !== 6) { $('linkHelp').textContent = 'ใส่รหัสให้ครบ 6 หลัก'; $('linkHelp').style.color = 'var(--err)'; return; }
       cfg.linkCode = c; save(); link.begin(c);
+    });
+
+    $('btnFetchModels').addEventListener('click', async () => {
+      const out = $('fetchRes');
+      if (!activeKey()) { out.style.color = 'var(--err)'; out.textContent = 'ใส่ API key ก่อน'; return; }
+      out.style.color = 'var(--muted)'; out.textContent = 'กำลังดึงรายชื่อโมเดล…';
+      try {
+        const list = await fetchModels();
+        cfg.modelList[cfg.provider] = list; save();
+        renderModelSelect();
+        out.style.color = 'var(--ok)';
+        out.textContent = `พบ ${list.length} โมเดล ✓ — เลือกได้ในรายการด้านบน หัวข้อ "ทั้งหมดที่ key นี้ใช้ได้" (ควรเลือกรุ่นที่รองรับรูปภาพ และลองกด "ทดสอบ API key" หลังเปลี่ยน)`;
+      } catch (e) {
+        out.style.color = 'var(--err)';
+        out.textContent = 'ดึงรายชื่อไม่ได้: ' + (e.status ? 'HTTP ' + e.status + ' — ' : '') + e.message;
+      }
     });
 
     $('btnTest').addEventListener('click', async () => {
